@@ -238,17 +238,34 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class STEFunction(torch.autograd.Function):
     # TODO: The class you need to implement for the Straight-Through Estimator (STE)  
     # described in Section 3.4.)
-    pass
+
+    @staticmethod
+    def forward(ctx, input):
+        return (input > 0.5).float() # binary 
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ## Clipping grad to -1 ~ 1
+        # return F.hardtanh(grad_output)
+        ## Act like Identity matrix
+        return (grad_output)
+        
 
 class AttentionGate(nn.Module):
     def __init__(self):
         super().__init__()
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, hidden_states: torch.Tensor):
+        # (batch_size, seq_len)
         soft_value_vectors = torch.full(
             hidden_states.shape[:2], 2.5
         ).to(hidden_states.device)
+        # mask last 12 ~ last 5 tokens
         soft_value_vectors[:, -12:-5] = -2.5
+
+        # Smooth output by the Sigmoid function
+        self.sigmoid(soft_value_vectors)
 
         masks = STEFunction.apply(soft_value_vectors)
         return masks
@@ -271,9 +288,9 @@ class Qwen2Attention(nn.Module):
             )
 
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
+        self.num_heads = config.num_attention_heads # 14: qeury_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_heads = config.num_key_value_heads # 2: kv_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
@@ -295,6 +312,7 @@ class Qwen2Attention(nn.Module):
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
+        self.attentionGate = AttentionGate() 
 
     def forward(
         self,
@@ -325,12 +343,40 @@ class Qwen2Attention(nn.Module):
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        position_length = kv_seq_len # for prefilling
+        if not position_ids.nelement() > 1: # for decoding
+            if position_length < position_ids.item()+1:
+                position_length = position_ids.item()+1
+                
+        cos, sin = self.rotary_emb(value_states, seq_len=position_length)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        if hidden_states.shape[-2] > 1: # prefilling stage
+            # hidden_states: (batch_size, seq_len, hidden_size) - (1, 1, 896)
+            # masks: (batch_size, seq_len) - (1, 25)
+            masks = self.attentionGate(hidden_states)
+            # unsqueeze mask: all heads have the same mask
+            expanded_mask = masks.unsqueeze(1).expand(-1, key_states.shape[1], -1)
+
+            # AG mask
+            masks = masks.unsqueeze(1).expand_as(attention_mask)
+            dtype = attention_mask.dtype
+            masks = torch.where(masks == 0, torch.finfo(dtype).min, 0.0)
+            masks[0, 0] = masks[0, 0].fill_diagonal_(0)
+
+            # AG mask + causal mask
+            # adding large negative values to the attn_weights makes the results after softmax 0
+            attention_mask += masks
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            if hidden_states.shape[-2] > 1: # prefilling stage 
+                stored_key_states = key_states[expanded_mask.bool()].view(key_states.shape[0], key_states.shape[1], -1, key_states.shape[-1])
+                stored_value_states = value_states[expanded_mask.bool()].view(value_states.shape[0], value_states.shape[1], -1, value_states.shape[-1])
+                stored_key_states, stored_value_states = past_key_value.update(stored_key_states, stored_value_states, self.layer_idx, cache_kwargs)
+            else: # decoding stage
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -866,7 +912,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
